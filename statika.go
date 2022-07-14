@@ -66,7 +66,6 @@ func init() {
 }
 
 func main() {
-
 	if len(opts.Server) > 0 {
 		fmt.Println("Serving...")
 		tasks.Server(cfg)
