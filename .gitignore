@@ -31,7 +31,6 @@ dist/
 *.code-workspace
 
 #Other
-
 node_modules
 .idea
 output
