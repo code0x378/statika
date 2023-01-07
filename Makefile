@@ -15,4 +15,4 @@ build-all:
 
 install:
 	@echo "Installing binary..."
-	cp bin/statika ~/bin
+	cp bin/statika ${GOPATH}/bin
