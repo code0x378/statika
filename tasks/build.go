@@ -24,11 +24,13 @@ import (
 	"statika/models"
 	"statika/util"
 	"strings"
+	"sync"
 	"time"
 )
 
 var m *minify.M
 var sm *stm.Sitemap
+var wg sync.WaitGroup
 
 type Pages map[string][]models.Page
 type Tags map[string]map[string][]models.Page
@@ -42,6 +44,7 @@ func init() {
 }
 
 func Build(cfg *models.Config) {
+
 	start := time.Now()
 	pages := make(Pages)
 	tags := make(Tags)
@@ -68,117 +71,12 @@ func Build(cfg *models.Config) {
 	util.Check(err)
 
 	sections := GetSections(cfg.ContentDir)
+	wg.Add(len(sections))
 
 	for _, section := range sections {
-
-		if section == "" {
-			continue
-		}
-
-		if cfg.Verbose {
-			fmt.Println("Section: ", section)
-		}
-
-		templates = loadTemplates(section, templates, cfg)
-		tags[section] = make(map[string][]models.Page)
-
-		sectionPath := filepath.Join(cfg.ContentDir, section)
-		files, err := ioutil.ReadDir(sectionPath)
-		util.Check(err)
-
-		// create and save a page for each markdown file
-		for _, file := range files {
-			if cfg.Verbose {
-				fmt.Println("Processing file: ", file.Name())
-			}
-
-			frontMatter, body := readMarkdownFile(filepath.Join(sectionPath + "/" + file.Name()))
-
-			if draft := util.GetBool(frontMatter, "draft"); draft {
-				continue
-			}
-
-			var buf bytes.Buffer
-			if err := md.Convert([]byte(body), &buf); err != nil {
-				util.Check(err)
-			}
-
-			page := models.Page{
-				Content:     buf.String(),
-				RawContent:  body,
-				Slug:        removeExtension(file.Name()),
-				Id:          util.GetString(frontMatter, "id"),
-				Uuid:        util.GetString(frontMatter, "uuid"),
-				Title:       util.GetString(frontMatter, "title"),
-				Subtitle:    util.GetString(frontMatter, "subtitle"),
-				Description: util.GetString(frontMatter, "subtitle"),
-				Website:     util.GetString(frontMatter, "website"),
-				Thumbnail:   util.GetString(frontMatter, "thumbnail"),
-				Author:      util.GetString(frontMatter, "author"),
-				Images:      util.GetSlice(frontMatter, "images"),
-				Tags:        util.GetSlice(frontMatter, "tags"),
-				Categories:  util.GetSlice(frontMatter, "categories"),
-				Date:        util.GetDate(frontMatter, "date"),
-				Data:        frontMatter,
-			}
-
-			var outputFilePath string
-			if section == "pages" {
-				outputFilePath = filepath.Join(cfg.OutputDir, removeExtension(file.Name()))
-				sm.Add(stm.URL{{"loc", "/" + page.Slug}})
-			} else {
-				outputFilePath = filepath.Join(cfg.OutputDir, section, removeExtension(file.Name()))
-				sm.Add(stm.URL{{"loc", "/" + section + "/" + page.Slug}})
-			}
-			makeDir(outputFilePath)
-			saveHtml(templates, section, "show", filepath.Join(outputFilePath, "index.html"), pongo2.Context{"page": page})
-
-			// add page to list of all pages in this section
-			pages[section] = append(pages[section], page)
-
-			// add this page to list of all tags
-			for _, tag := range page.Tags {
-				tags[section][tag] = append(tags[section][tag], page)
-			}
-		}
-
-		// sort all pages by date desc to list on index pages
-		for _, section := range sections {
-			sort.Slice(pages[section], func(i, j int) bool {
-				return pages[section][i].Date.After(pages[section][j].Date)
-			})
-		}
-
-		// sort tags
-		sortedTags := make([]string, 0, len(tags[section]))
-		for t := range tags[section] {
-			sortedTags = append(sortedTags, t)
-		}
-		sort.Slice(sortedTags, func(i, j int) bool {
-			return strings.ToLower(sortedTags[i]) < strings.ToLower(sortedTags[j])
-		}) //case-insensitive sort
-
-		if section != "pages" {
-			// write list index for section
-			outputFilePath := filepath.Join(cfg.OutputDir, section)
-			makeDir(outputFilePath)
-			saveHtml(templates, section, "list", filepath.Join(outputFilePath, "index.html"), pongo2.Context{"pages": pages[section], "tags": tags[section], "sortedTags": sortedTags})
-			sm.Add(stm.URL{{"loc", "/" + section}})
-
-			// write list index for each tag in this section
-			for key, val := range tags[section] {
-				tagPath := filepath.Join(outputFilePath, "tags", slug.Make(key))
-				makeDir(tagPath)
-				saveHtml(templates, section, "list", filepath.Join(tagPath, "index.html"), pongo2.Context{"pages": val, "tags": tags[section], "sortedTags": sortedTags, "tag": key})
-				util.Check(err)
-			}
-
-			// write tags page containing an index and count of all tags
-			saveHtml(templates, section, "tags", filepath.Join(outputFilePath, "tags", "index.html"), pongo2.Context{"tags": tags[section], "sortedTags": sortedTags})
-			sm.Add(stm.URL{{"loc", "/" + section + "/" + "tags"}})
-			util.Check(err)
-		}
+		go buildSections(cfg, section, pages, tags, templates, md)
 	}
+	wg.Wait()
 
 	// write the site's home page
 	saveHtml(templates, "pages", "home", filepath.Join(cfg.OutputDir, "index.html"), pongo2.Context{"pages": pages, "tags": tags})
@@ -187,6 +85,117 @@ func Build(cfg *models.Config) {
 	sm.Finalize()
 	duration := time.Since(start)
 	fmt.Println("Finished building: ", duration)
+}
+
+func buildSections(cfg *models.Config, section string, pages Pages, tags Tags, templates Templates, md goldmark.Markdown) {
+	defer wg.Done()
+
+	// a temporary hack that will probably out live me
+	if section == "publications" {
+		section = "publications/category"
+	}
+
+	if cfg.Verbose {
+		fmt.Println("Section: ", section)
+	}
+
+	templates = loadTemplates(section, templates, cfg)
+	tags[section] = make(map[string][]models.Page)
+
+	sectionPath := filepath.Join(cfg.ContentDir, section)
+	files, err := ioutil.ReadDir(sectionPath)
+	util.Check(err)
+
+	// create and save a page for each markdown file
+	for _, file := range files {
+		if cfg.Verbose {
+			fmt.Println("Processing file: ", file.Name())
+		}
+
+		frontMatter, body := readMarkdownFile(filepath.Join(sectionPath + "/" + file.Name()))
+
+		if draft := util.GetBool(frontMatter, "draft"); draft {
+			continue
+		}
+
+		var buf bytes.Buffer
+		if err := md.Convert([]byte(body), &buf); err != nil {
+			util.Check(err)
+		}
+
+		page := models.Page{
+			Content:     buf.String(),
+			RawContent:  body,
+			Slug:        removeExtension(file.Name()),
+			Id:          util.GetString(frontMatter, "id"),
+			Uuid:        util.GetString(frontMatter, "uuid"),
+			Title:       util.GetString(frontMatter, "title"),
+			Subtitle:    util.GetString(frontMatter, "subtitle"),
+			Description: util.GetString(frontMatter, "subtitle"),
+			Website:     util.GetString(frontMatter, "website"),
+			Thumbnail:   util.GetString(frontMatter, "thumbnail"),
+			Author:      util.GetString(frontMatter, "author"),
+			Images:      util.GetSlice(frontMatter, "images"),
+			Tags:        util.GetSlice(frontMatter, "tags"),
+			Categories:  util.GetSlice(frontMatter, "categories"),
+			Date:        util.GetDate(frontMatter, "date"),
+			Data:        frontMatter,
+		}
+
+		var outputFilePath string
+		if section == "pages" {
+			outputFilePath = filepath.Join(cfg.OutputDir, removeExtension(file.Name()))
+			sm.Add(stm.URL{{"loc", "/" + page.Slug}})
+		} else {
+			outputFilePath = filepath.Join(cfg.OutputDir, section, removeExtension(file.Name()))
+			sm.Add(stm.URL{{"loc", "/" + section + "/" + page.Slug}})
+		}
+		makeDir(outputFilePath)
+		saveHtml(templates, section, "show", filepath.Join(outputFilePath, "index.html"), pongo2.Context{"page": page})
+
+		// add page to list of all pages in this section
+		pages[section] = append(pages[section], page)
+
+		// add this page to list of all tags
+		for _, tag := range page.Tags {
+			tagKey := strings.ToLower(tag)
+			tags[section][tagKey] = append(tags[section][tagKey], page)
+		}
+	}
+
+	sort.Slice(pages[section], func(i, j int) bool {
+		return pages[section][i].Date.After(pages[section][j].Date)
+	})
+
+	// sort tags
+	sortedTags := make([]string, 0, len(tags[section]))
+	for t := range tags[section] {
+		sortedTags = append(sortedTags, t)
+	}
+	sort.Slice(sortedTags, func(i, j int) bool {
+		return strings.ToLower(sortedTags[i]) < strings.ToLower(sortedTags[j])
+	}) //case-insensitive sort
+
+	if section != "pages" {
+		// write list index for section
+		outputFilePath := filepath.Join(cfg.OutputDir, section)
+		makeDir(outputFilePath)
+		saveHtml(templates, section, "list", filepath.Join(outputFilePath, "index.html"), pongo2.Context{"pages": pages[section], "tags": tags[section], "sortedTags": sortedTags})
+		sm.Add(stm.URL{{"loc", "/" + section}})
+
+		// write list index for each tag in this section
+		for key, val := range tags[section] {
+			tagPath := filepath.Join(outputFilePath, "tags", slug.Make(key))
+			makeDir(tagPath)
+			saveHtml(templates, section, "list", filepath.Join(tagPath, "index.html"), pongo2.Context{"pages": val, "tags": tags[section], "sortedTags": sortedTags, "tag": key})
+			util.Check(err)
+		}
+
+		// write tags page containing an index and count of all tags
+		saveHtml(templates, section, "tags", filepath.Join(outputFilePath, "tags", "index.html"), pongo2.Context{"tags": tags[section], "sortedTags": sortedTags})
+		sm.Add(stm.URL{{"loc", "/" + section + "/" + "tags"}})
+		util.Check(err)
+	}
 }
 
 func saveHtml(templates Templates, section string, pageType string, path string, context pongo2.Context) {
